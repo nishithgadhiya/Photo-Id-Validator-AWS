@@ -1,0 +1,249 @@
+  AWSTemplateFormatVersion: 2010-09-09
+  Resources:
+    ApiGatewayRestApi:
+      Type: AWS::ApiGateway::RestApi
+      Properties:
+        Name: store1
+
+    ApiGatewayResource:
+      Type: AWS::ApiGateway::Resource
+      Properties:
+        RestApiId: !Ref ApiGatewayRestApi
+        ParentId:
+          Fn::GetAtt:
+          - ApiGatewayRestApi
+          - RootResourceId
+        PathPart: store1
+
+    ApiGatewayMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        RestApiId: !Ref ApiGatewayRestApi
+        ResourceId: !Ref ApiGatewayResource
+        HttpMethod: POST
+        AuthorizationType: NONE
+        Integration:
+          Type: AWS
+          IntegrationHttpMethod: POST
+          Uri:
+            Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunction.Arn}/invocations
+          IntegrationResponses:
+            - StatusCode: '200'
+              ResponseParameters:
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+        MethodResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+
+
+    CorsMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        AuthorizationType: NONE
+        RestApiId: !Ref ApiGatewayRestApi
+        ResourceId: !Ref ApiGatewayResource
+        HttpMethod: OPTIONS
+        Integration:
+          Type: MOCK
+          IntegrationResponses:
+            - StatusCode: '200'
+              ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+          RequestTemplates:
+            application/json: "{\"statusCode\": 200}"
+        MethodResponses:
+          - StatusCode: '200'
+            ResponseModels:
+              application/json: Empty
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+
+    lambdaApiGatewayInvoke:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: arn:aws:lambda:us-east-1:106598742668:function:transit
+        Principal: "apigateway.amazonaws.com"
+        SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/POST/store1"
+
+
+    ApiGatewayDeployment:
+      Type: 'AWS::ApiGateway::Deployment'
+      DependsOn:
+        - ApiGatewayMethod
+      Properties:
+        RestApiId: !Ref ApiGatewayRestApi
+        StageName: prod
+
+
+
+    LambdaFunction:
+      Type: AWS::Lambda::Function
+      Properties:
+        FunctionName: transit
+        Code:
+          ZipFile: |
+            import json
+            import boto3
+            import base64
+
+            s3 = boto3.client('s3')
+            sns = boto3.client('sns')
+            rekognition = boto3.client('rekognition')
+
+            def lambda_handler(event, context):
+                
+                action_type = event['type']
+                
+                # Code to validate with Id
+                if(action_type == 'validate'):
+                        print('validate')
+                        # Get the image data from req body
+                        image_str = event['image']
+                        # Decode base64 
+                        image_bytes = base64.b64decode(image_str)
+                        
+                        # Check if there are any objects in the bucket
+                        find_image = s3.list_objects_v2(Bucket='ngadhiya-find-person')
+
+                        # Compare with the id
+                        response = rekognition.compare_faces(
+                            SourceImage={'Bytes': image_bytes},
+                            TargetImage={'Bytes': image_bytes}
+                        )
+                        
+                        match = len(response["FaceMatches"]) > 1
+                        unmatch = len(response["UnmatchedFaces"]) < 1
+                        similarity_score = response["FaceMatches"][0]["Similarity"] if match else 0
+                        
+                        # If wanted person image is in s3
+                        if(find_image['KeyCount'] > 0):
+                            source_response = s3.get_object(Bucket='ngadhiya-find-person', Key='findPerson')['Body'].read()
+                            #Compare with wanted person
+                            response_find_person = rekognition.compare_faces(
+                                SourceImage={'Bytes': source_response},
+                                TargetImage={'Bytes': image_bytes}
+                            )
+                            match_find_person = len(response_find_person["FaceMatches"]) > 0
+                            
+                            # If any face matches with wanted person Notify!
+                            if(match_find_person):
+                                    subject = 'Matching person is detected'
+                                    message = 'This email is to notify that, matching face of a person with the database is detected.'
+                                    sns.publish(TopicArn='arn:aws:sns:us-east-1:106598742668:pass-email-notify', Subject=subject, Message=message)
+                        
+                        # Validate with id
+                        if(match is not None and unmatch is not None):
+                          print("in")
+                          response = {
+                              "statusCode": 200,
+                              "headers": {
+                                  "Content-Type": "application/json"
+                              },
+                              "body": json.dumps({
+                                  "match": match,
+                                  "unmatch": unmatch,
+                                  "similarity_score": similarity_score
+                              })
+                          }
+                      
+                          return response
+                # Code to upload the wanted person image in s3
+                elif(action_type == 'upload'):
+                        # Get the image data from req body
+                        image_str = event['image']
+                        # Decode base64 
+                        image_bytes = base64.b64decode(image_str)
+                        
+                        # Upload the image to S3
+                        bucket_name = 'ngadhiya-find-person'
+                        s3.put_object(
+                            Body=image_bytes, Bucket=bucket_name, Key='findPerson'
+                        )
+                        
+                        return {
+                            'statusCode': 200,
+                            'body': {
+                                'message': 'success'
+                            }
+                        }
+
+
+        Handler: index.lambda_handler
+        Role: arn:aws:iam::106598742668:role/LabRole
+        Runtime: python3.8
+        Timeout: 30
+
+    SNSTopic:
+      Type: "AWS::SNS::Topic"
+      Properties:
+        DisplayName: "pass-email-notify"
+        TopicName: "pass-email-notify"
+
+    SNSSubscription:
+      Type: "AWS::SNS::Subscription"
+      Properties:
+        Protocol: "email"
+        TopicArn: !Ref SNSTopic
+        Endpoint: "gadhiyanishith@gmail.com"
+
+    NgadhiyaFindBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ngadhiya-find-person
+
+    MyInstance:
+      Type: "AWS::EC2::Instance"
+      Properties:
+        ImageId: ami-06e46074ae430fba6   
+        InstanceType: "t2.medium"
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            sudo yum update -y
+            sudo yum install -y nginx git
+            sudo curl --silent --location https://rpm.nodesource.com/setup_14.x | bash -
+            sudo yum install -y nodejs
+            # sudo git clone gitrepo
+            # cd gitrepo
+            PORT=80
+            echo "REACT_APP_BACKEND_URL=https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/store1" > .env
+            echo "PORT=$PORT" >> .env
+            npm install
+            npm run build
+            cat > /etc/nginx/conf.d/react.conf <<EOF
+            server {
+                  listen 80;
+                  listen [::]:80;
+                  root /ngadhiya/Term/build;
+                  location / {
+                      try_files \$uri /index.html;
+                  }
+            }
+            EOF
+            sudo service nginx start
+
+    MySecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Enable SSH, HTTP, and HTTPS access
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
